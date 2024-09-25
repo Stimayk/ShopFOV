@@ -42,7 +42,7 @@ namespace ShopFOV
         {
             if (JsonFOV == null || SHOP_API == null) return;
 
-            SHOP_API.CreateCategory(CategoryName, "Угол обзора");
+            SHOP_API.CreateCategory(CategoryName, "РР·РјРµРЅРµРЅРёРµ FOV");
 
             var sortedItems = JsonFOV
                 .Properties()
