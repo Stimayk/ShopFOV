@@ -1,104 +1,142 @@
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
+using CounterStrikeSharp.API.Core.Attributes;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
 using Microsoft.Extensions.Logging;
-using Newtonsoft.Json.Linq;
 using ShopAPI;
+using System.Collections.Concurrent;
+using System.Text.Json.Serialization;
 
 namespace ShopFOV
 {
-    public class ShopFOV : BasePlugin
+    public class PluginConfig : BasePluginConfig
+    {
+        [JsonPropertyName("items")]
+        public Dictionary<string, ShopItem> Items { get; set; } = [];
+    }
+
+    public class ShopItem
+    {
+        [JsonPropertyName("name")]
+        public required string Name { get; set; }
+
+        [JsonPropertyName("price")]
+        public int Price { get; set; }
+
+        [JsonPropertyName("sell_price")]
+        public int SellPrice { get; set; }
+
+        [JsonPropertyName("duration")]
+        public int Duration { get; set; }
+
+        [JsonPropertyName("fov")]
+        public int FOV { get; set; } = 90;
+    }
+
+    [MinimumApiVersion(80)]
+    public class ShopFOV : BasePlugin, IPluginConfig<PluginConfig>
     {
         public override string ModuleName => "[SHOP] FOV";
-        public override string ModuleDescription => "";
+        public override string ModuleDescription => "Provides FOV customization through shop";
         public override string ModuleAuthor => "E!N";
-        public override string ModuleVersion => "v1.0.1";
+        public override string ModuleVersion => "v2.0.0";
 
-        private IShopApi? SHOP_API;
+        public PluginConfig Config { get; set; } = null!;
+        private IShopApi? _shopApi;
+        private readonly ConcurrentDictionary<int, PlayerFOV> _playerFovs = new();
         private const string CategoryName = "FOV";
-        public static JObject? JsonFOV { get; private set; }
-        private readonly PlayerFOV[] playerFOV = new PlayerFOV[65];
+
+        public void OnConfigParsed(PluginConfig config)
+        {
+            Config = config;
+        }
 
         public override void OnAllPluginsLoaded(bool hotReload)
         {
-            SHOP_API = IShopApi.Capability.Get();
-            if (SHOP_API == null) return;
-
-            LoadConfig();
-            InitializeShopItems();
-            SetupTimersAndListeners();
-        }
-
-        private void LoadConfig()
-        {
-            string configPath = Path.Combine(ModuleDirectory, "../../configs/plugins/Shop/FOV.json");
-            if (File.Exists(configPath))
+            _shopApi = IShopApi.Capability.Get();
+            if (_shopApi == null)
             {
-                JsonFOV = JObject.Parse(File.ReadAllText(configPath));
+                Logger.LogError("Failed to get Shop API capability!");
+                return;
             }
+
+            InitializeShopCategory();
+            RegisterEventHandlers();
         }
 
-        private void InitializeShopItems()
+        private void InitializeShopCategory()
         {
-            if (JsonFOV == null || SHOP_API == null) return;
-
-            SHOP_API.CreateCategory(CategoryName, "Изменение FOV");
-
-            var sortedItems = JsonFOV
-                .Properties()
-                .Select(p => new { Key = p.Name, Value = (JObject)p.Value })
-                .OrderBy(p => (int)p.Value["fov"]!)
-                .ToList();
-
-            foreach (var item in sortedItems)
+            if (Config.Items.Count == 0)
             {
-                Task.Run(async () =>
+                Logger.LogWarning("No items found in configuration!");
+                return;
+            }
+
+            _shopApi!.CreateCategory(CategoryName, Localizer["CategoryName"]);
+
+            foreach (var (itemId, item) in Config.Items.OrderBy(x => x.Value.FOV))
+            {
+                try
                 {
-                    int itemId = await SHOP_API.AddItem(item.Key, (string)item.Value["name"]!, CategoryName, (int)item.Value["price"]!, (int)item.Value["sellprice"]!, (int)item.Value["duration"]!);
-                    SHOP_API.SetItemCallbacks(itemId, OnClientBuyItem, OnClientSellItem, OnClientToggleItem);
-                }).Wait();
+                    var shopItemId = _shopApi.AddItem(
+                        itemId,
+                        item.Name,
+                        CategoryName,
+                        item.Price,
+                        item.SellPrice,
+                        item.Duration
+                    ).GetAwaiter().GetResult();
+
+                    _shopApi.SetItemCallbacks(
+                        shopItemId,
+                        OnClientBuyItem,
+                        OnClientSellItem,
+                        OnClientToggleItem
+                    );
+                }
+                catch (Exception ex)
+                {
+                    Logger.LogError($"Failed to initialize item {itemId}: {ex.Message}");
+                }
             }
         }
 
-        private void SetupTimersAndListeners()
+        private void RegisterEventHandlers()
         {
-            RegisterListener<Listeners.OnClientDisconnect>(playerSlot => playerFOV[playerSlot] = null!);
+            RegisterListener<Listeners.OnClientDisconnect>(slot =>
+            {
+                _ = _playerFovs.TryRemove(slot, out _);
+            });
         }
 
-        public HookResult OnClientBuyItem(CCSPlayerController player, int itemId, string categoryName, string uniqueName, int buyPrice, int sellPrice, int duration, int count)
+        private HookResult OnClientBuyItem(CCSPlayerController player, int itemId, string category, string itemName, int price, int sellPrice, int duration, int count)
         {
-            if (TryGetItemFOV(uniqueName, out int fov))
-            {
-                playerFOV[player.Slot] = new PlayerFOV(fov, itemId);
-            }
-            else
-            {
-                Logger.LogError($"{uniqueName} has invalid or missing 'fov' in config!");
-            }
+            if (!IsValidPlayer(player) || !Config.Items.TryGetValue(itemName, out var item))
+                return HookResult.Continue;
 
+            _playerFovs[player.Slot] = new PlayerFOV(item.FOV, itemId);
+            ApplyFov(player);
             return HookResult.Continue;
         }
 
-        public HookResult OnClientToggleItem(CCSPlayerController player, int itemId, string uniqueName, int state)
+        private HookResult OnClientToggleItem(CCSPlayerController player, int itemId, string itemName, int state)
         {
-            if (state == 1 && TryGetItemFOV(uniqueName, out int fov))
-            {
-                playerFOV[player.Slot] = new PlayerFOV(fov, itemId);
-            }
-            else if (state == 0)
-            {
-                OnClientSellItem(player, itemId, uniqueName, 0);
-            }
+            if (!IsValidPlayer(player))
+                return HookResult.Continue;
 
+            _ = state == 1
+                ? OnClientBuyItem(player, itemId, CategoryName, itemName, 0, 0, 0, 0)
+                : OnClientSellItem(player, itemId, itemName, 0);
             return HookResult.Continue;
         }
 
-        public HookResult OnClientSellItem(CCSPlayerController player, int itemId, string uniqueName, int sellPrice)
+        private HookResult OnClientSellItem(CCSPlayerController player, int itemId, string itemName, int sellPrice)
         {
-            playerFOV[player.Slot] = null!;
-            player.DesiredFOV = 90;
-            Utilities.SetStateChanged(player, "CBasePlayerController", "m_iDesiredFOV");
+            if (!IsValidPlayer(player))
+                return HookResult.Continue;
 
+            _ = _playerFovs.TryRemove(player.Slot, out _);
+            ResetFov(player);
             return HookResult.Continue;
         }
 
@@ -106,32 +144,33 @@ namespace ShopFOV
         public HookResult OnPlayerSpawn(EventPlayerSpawn @event, GameEventInfo info)
         {
             var player = @event.Userid;
-            if (player != null && !player.IsBot && playerFOV[player.Slot] != null)
+            if (IsValidPlayer(player!))
             {
-                ChangeFov(player);
+                ApplyFov(player!);
             }
             return HookResult.Continue;
         }
 
-        private void ChangeFov(CCSPlayerController player)
+        private void ApplyFov(CCSPlayerController player)
         {
-            var fov = (uint)playerFOV[player.Slot].FOV;
-            player.DesiredFOV = fov;
+            if (_playerFovs.TryGetValue(player.Slot, out var fovData))
+            {
+                player.DesiredFOV = (uint)fovData.FOV;
+                Utilities.SetStateChanged(player, "CBasePlayerController", "m_iDesiredFOV");
+            }
+        }
+
+        private static void ResetFov(CCSPlayerController player)
+        {
+            player.DesiredFOV = 90;
             Utilities.SetStateChanged(player, "CBasePlayerController", "m_iDesiredFOV");
         }
 
-        private bool TryGetItemFOV(string uniqueName, out int fov)
+        private static bool IsValidPlayer(CCSPlayerController player)
         {
-            fov = 90;
-            if (JsonFOV != null && JsonFOV.TryGetValue(uniqueName, out var obj) && obj is JObject jsonItem && jsonItem["fov"] != null && jsonItem["fov"]!.Type != JTokenType.Null)
-            {
-                fov = (int)jsonItem["fov"]!;
-                return true;
-            }
-            return false;
+            return player is { IsValid: true, PlayerPawn.IsValid: true, IsBot: false };
         }
 
-        public record class PlayerFOV(int FOV, int ItemID);
-
+        private record PlayerFOV(int FOV, int ItemId);
     }
 }
